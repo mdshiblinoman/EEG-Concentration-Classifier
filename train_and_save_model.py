@@ -16,7 +16,11 @@ def parse_args() -> argparse.Namespace:
         "csv_path",
         nargs="?",
         default="pyeeg_processed_features.csv",
-        help="Path to the feature CSV produced by the notebook.",
+        help="Path to the training feature CSV produced by the notebook.",
+    )
+    parser.add_argument(
+        "--test-csv",
+        help="Optional held-out test feature CSV. Use this for the notebook train/test workflow.",
     )
     parser.add_argument(
         "--model-path",
@@ -46,8 +50,10 @@ def main() -> None:
         )
 
     df = pd.read_csv(csv_path)
+    test_df = pd.read_csv(args.test_csv) if args.test_csv else None
     artifact, result = train_model(
         df,
+        test_df=test_df,
         balance=not args.no_balance,
         model_type=args.model_type,
     )
@@ -55,7 +61,9 @@ def main() -> None:
     save_artifact(artifact, model_path)
 
     print(f"Saved model to {model_path}")
+    print(f"Evaluation: {result.evaluation_mode}")
     print(f"Rows used: {result.rows_used}")
+    print(f"Test rows: {result.test_rows_used}")
     print(f"Accuracy: {result.accuracy:.4f}")
     print(f"Classes: {', '.join(result.classes)}")
 

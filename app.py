@@ -294,12 +294,21 @@ def training_panel(model_path: Path) -> None:
 
 
 def train_from_feature_csv(model_path: Path) -> None:
-    st.write("Use labeled feature CSV files produced by the notebook or this app.")
+    st.write(
+        "Use labeled feature CSV files produced by the notebook or this app. "
+        "For the leakage-free notebook workflow, upload train and test feature CSVs separately."
+    )
 
-    uploaded_files = st.file_uploader(
-        "Upload feature CSV file(s)",
+    train_files = st.file_uploader(
+        "Training feature CSV file(s)",
         type=["csv"],
-        key="training_file",
+        key="training_feature_files",
+        accept_multiple_files=True,
+    )
+    test_files = st.file_uploader(
+        "Held-out test feature CSV file(s) (optional)",
+        type=["csv"],
+        key="test_feature_files",
         accept_multiple_files=True,
     )
     balance = st.checkbox("Balance classes before training", value=True)
@@ -309,14 +318,40 @@ def train_from_feature_csv(model_path: Path) -> None:
         help="Random Forest is recommended when XGBoost is not installed.",
     )
 
-    if not uploaded_files:
+    if not train_files:
         st.info(
             "Required columns: "
             + ", ".join(FEATURE_COLUMNS)
-            + f", {TARGET_COLUMN}. If {TARGET_COLUMN} is missing, upload separate files and assign labels below."
+            + f", {TARGET_COLUMN}. Upload notebook train and test CSVs separately to avoid data leakage."
         )
         return
 
+    train_frames = collect_feature_frames(train_files, "train_feature_csv")
+    test_frames = collect_feature_frames(test_files, "test_feature_csv") if test_files else []
+
+    if not train_frames:
+        return
+
+    train_df = pd.concat(train_frames, ignore_index=True)
+    test_df = pd.concat(test_frames, ignore_index=True) if test_frames else None
+
+    st.write(f"Training rows ready: {len(train_df):,}")
+    show_class_counts(train_df, "Training class distribution")
+    if test_df is not None:
+        st.write(f"Held-out test rows ready: {len(test_df):,}")
+        show_class_counts(test_df, "Held-out test class distribution")
+    else:
+        st.info("No held-out test CSV uploaded. The app will report accuracy from an internal stratified split.")
+
+    if train_df[TARGET_COLUMN].value_counts().size < 2:
+        st.warning("Training needs both High Concentration and Low Concentration examples. Upload another labeled file or use a CSV that already contains both labels.")
+        return
+
+    if st.button("Train and save", type="primary"):
+        train_and_persist(train_df, model_path, balance, model_type_label, test_df=test_df)
+
+
+def collect_feature_frames(uploaded_files: list, key_prefix: str) -> list[pd.DataFrame]:
     frames = []
     for index, uploaded_file in enumerate(uploaded_files):
         df = pd.read_csv(uploaded_file)
@@ -330,7 +365,7 @@ def train_from_feature_csv(model_path: Path) -> None:
             assigned_label = st.selectbox(
                 f"Label for {uploaded_file.name}",
                 ["High Concentration", "Low Concentration"],
-                key=f"feature_csv_label_{index}",
+                key=f"{key_prefix}_label_{index}",
             )
             labeled_df[TARGET_COLUMN] = assigned_label
         else:
@@ -340,32 +375,32 @@ def train_from_feature_csv(model_path: Path) -> None:
             )
 
         frames.append(labeled_df)
+    return frames
 
-    if not frames:
-        return
 
-    df = pd.concat(frames, ignore_index=True)
-    class_counts = df[TARGET_COLUMN].value_counts()
-    st.write(f"Rows ready for training: {len(df):,}")
-    class_count_df = class_counts.rename_axis(TARGET_COLUMN).reset_index(name="Rows")
+def show_class_counts(df: pd.DataFrame, title: str) -> None:
+    st.write(title)
+    class_count_df = df[TARGET_COLUMN].value_counts().rename_axis(TARGET_COLUMN).reset_index(name="Rows")
     st.dataframe(class_count_df, use_container_width=True)
-
-    if class_counts.size < 2:
-        st.warning("Training needs both High Concentration and Low Concentration examples. Upload another labeled file or use a CSV that already contains both labels.")
-        return
-
-    if st.button("Train and save", type="primary"):
-        train_and_persist(df, model_path, balance, model_type_label)
 
 
 def train_from_raw_eeg(model_path: Path) -> None:
-    st.write("Upload raw experiment files where first 60s and last 60s are low concentration, and middle 60s is high concentration.")
+    st.write(
+        "Upload raw experiment files where first 60s and last 60s are low concentration, "
+        "and middle 60s is high concentration. Use separate held-out test files to match the notebook."
+    )
 
     uploaded_files = st.file_uploader(
         "Upload raw EEG training files",
         type=["edf", "csv"],
         accept_multiple_files=True,
         key="raw_training_files",
+    )
+    test_uploaded_files = st.file_uploader(
+        "Upload held-out raw EEG test files (optional)",
+        type=["edf", "csv"],
+        accept_multiple_files=True,
+        key="raw_test_files",
     )
 
     columns = st.columns(4)
@@ -408,37 +443,25 @@ def train_from_raw_eeg(model_path: Path) -> None:
         return
 
     if st.button("Extract, train, and save from raw EEG", type="primary"):
-        feature_frames = []
-        errors = []
-        for uploaded_file in uploaded_files:
-            try:
-                suffix = Path(uploaded_file.name).suffix.lower()
-                if suffix == ".edf":
-                    data, sfreq, channel_names = load_edf_upload(uploaded_file)
-                else:
-                    csv_df = pd.read_csv(uploaded_file)
-                    data, channel_names = read_numeric_csv(csv_df)
-                    sfreq = float(csv_sfreq)
-
-                processed = preprocess_signal(
-                    data,
-                    sfreq,
-                    l_freq=float(l_freq),
-                    h_freq=float(h_freq),
-                    notch_freq=float(notch_freq),
-                    apply_car=apply_car,
-                )
-                feature_frames.append(
-                    extract_labeled_experiment_features(
-                        processed,
-                        sfreq,
-                        channel_names,
-                        source_name=uploaded_file.name,
-                        segment_seconds=float(segment_seconds),
-                    )
-                )
-            except ValueError as exc:
-                errors.append(f"{uploaded_file.name}: {exc}")
+        feature_frames, errors = extract_uploaded_experiment_features(
+            uploaded_files,
+            csv_sfreq=float(csv_sfreq),
+            segment_seconds=float(segment_seconds),
+            l_freq=float(l_freq),
+            h_freq=float(h_freq),
+            notch_freq=float(notch_freq),
+            apply_car=apply_car,
+        )
+        test_feature_frames, test_errors = extract_uploaded_experiment_features(
+            test_uploaded_files,
+            csv_sfreq=float(csv_sfreq),
+            segment_seconds=float(segment_seconds),
+            l_freq=float(l_freq),
+            h_freq=float(h_freq),
+            notch_freq=float(notch_freq),
+            apply_car=apply_car,
+        )
+        errors.extend(test_errors)
 
         if errors:
             st.error("\n".join(errors))
@@ -446,6 +469,7 @@ def train_from_raw_eeg(model_path: Path) -> None:
             return
 
         training_df = pd.concat(feature_frames, ignore_index=True)
+        test_df = pd.concat(test_feature_frames, ignore_index=True) if test_feature_frames else None
         st.success(f"Created {len(training_df):,} labeled feature rows.")
         st.dataframe(training_df.head(100), use_container_width=True)
         st.download_button(
@@ -454,7 +478,60 @@ def train_from_raw_eeg(model_path: Path) -> None:
             file_name="raw_training_features.csv",
             mime="text/csv",
         )
-        train_and_persist(training_df, model_path, balance, model_type_label)
+        if test_df is not None:
+            st.success(f"Created {len(test_df):,} held-out test feature rows.")
+            st.dataframe(test_df.head(100), use_container_width=True)
+            st.download_button(
+                "Download raw test features",
+                data=test_df.to_csv(index=False).encode("utf-8"),
+                file_name="raw_test_features.csv",
+                mime="text/csv",
+            )
+        train_and_persist(training_df, model_path, balance, model_type_label, test_df=test_df)
+
+
+def extract_uploaded_experiment_features(
+    uploaded_files: list,
+    *,
+    csv_sfreq: float,
+    segment_seconds: float,
+    l_freq: float,
+    h_freq: float,
+    notch_freq: float,
+    apply_car: bool,
+) -> tuple[list[pd.DataFrame], list[str]]:
+    feature_frames = []
+    errors = []
+    for uploaded_file in uploaded_files or []:
+        try:
+            suffix = Path(uploaded_file.name).suffix.lower()
+            if suffix == ".edf":
+                data, sfreq, channel_names = load_edf_upload(uploaded_file)
+            else:
+                csv_df = pd.read_csv(uploaded_file)
+                data, channel_names = read_numeric_csv(csv_df)
+                sfreq = csv_sfreq
+
+            processed = preprocess_signal(
+                data,
+                sfreq,
+                l_freq=l_freq,
+                h_freq=h_freq,
+                notch_freq=notch_freq,
+                apply_car=apply_car,
+            )
+            feature_frames.append(
+                extract_labeled_experiment_features(
+                    processed,
+                    sfreq,
+                    channel_names,
+                    source_name=uploaded_file.name,
+                    segment_seconds=segment_seconds,
+                )
+            )
+        except ValueError as exc:
+            errors.append(f"{uploaded_file.name}: {exc}")
+    return feature_frames, errors
 
 
 def train_and_persist(
@@ -462,10 +539,17 @@ def train_and_persist(
     model_path: Path,
     balance: bool,
     model_type_label: str,
+    *,
+    test_df: pd.DataFrame | None = None,
 ) -> None:
     try:
         model_type = "random_forest" if model_type_label == "Random Forest" else "xgboost"
-        artifact, result = train_model(df, balance=balance, model_type=model_type)
+        artifact, result = train_model(
+            df,
+            test_df=test_df,
+            balance=balance,
+            model_type=model_type,
+        )
         save_artifact(artifact, model_path)
     except ValueError as exc:
         st.error(str(exc))
@@ -474,10 +558,12 @@ def train_and_persist(
     st.cache_resource.clear()
     st.success(f"Model saved to {model_path}")
 
-    metric_columns = st.columns(3)
+    metric_columns = st.columns(4)
     metric_columns[0].metric("Accuracy", f"{result.accuracy:.2%}")
-    metric_columns[1].metric("Rows used", f"{result.rows_used:,}")
-    metric_columns[2].metric("Classes", str(len(result.classes)))
+    metric_columns[1].metric("Training rows", f"{result.rows_used:,}")
+    metric_columns[2].metric("Test rows", f"{result.test_rows_used:,}")
+    metric_columns[3].metric("Classes", str(len(result.classes)))
+    st.caption(f"Evaluation: {result.evaluation_mode}")
 
     cm = pd.DataFrame(
         result.confusion_matrix,
@@ -512,7 +598,10 @@ def main() -> None:
             st.success("Saved model loaded.")
             st.write(metadata.get("model_name", "Concentration classifier"))
             if "accuracy" in metadata:
-                st.metric("Notebook-style test accuracy", f"{metadata['accuracy']:.2%}")
+                metric_label = metadata.get("evaluation_mode", "Model accuracy")
+                st.metric(metric_label, f"{metadata['accuracy']:.2%}")
+            if "test_rows_used" in metadata:
+                st.write(f"Test rows: {metadata['test_rows_used']:,}")
             st.write("Classes: " + ", ".join(metadata.get("classes", [])))
 
     train_tab, real_eeg_tab, single_tab, batch_tab = st.tabs(

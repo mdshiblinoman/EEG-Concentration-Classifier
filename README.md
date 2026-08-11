@@ -28,6 +28,13 @@ Then train and save the classifier:
 python train_and_save_model.py pyeeg_processed_features.csv
 ```
 
+For the leakage-free workflow in `remove_data_leakage.ipynb`, export the notebook's
+train and held-out test feature tables separately, then pass the test CSV:
+
+```bash
+python train_and_save_model.py pyeeg_processed_train_features.csv --test-csv pyeeg_processed_test_features.csv
+```
+
 By default this trains a Random Forest model, which only needs scikit-learn.
 To train the notebook-style XGBoost model instead:
 
@@ -37,6 +44,9 @@ python train_and_save_model.py pyeeg_processed_features.csv --model-type xgboost
 
 You can also train from inside the Streamlit app by uploading the same CSV in the
 `Train model` tab.
+The website now has separate upload fields for training feature CSVs and held-out
+test feature CSVs, matching the notebook's Train/Test split and avoiding random
+row-level leakage.
 
 If a feature CSV does not include `Segment_Type`, the app lets you assign one
 label to that whole file. To train a useful model, provide examples for both
@@ -47,7 +57,8 @@ You can train from raw EEG in the app too:
 1. Open `Train model`
 2. Choose `Train from raw EEG`
 3. Upload EDF or numeric CSV experiment files
-4. Click `Extract, train, and save from raw EEG`
+4. Optionally upload separate held-out raw test files
+5. Click `Extract, train, and save from raw EEG`
 
 This raw-training path assumes each file follows the notebook experiment layout:
 the first segment is low concentration, the middle segment is high concentration,
