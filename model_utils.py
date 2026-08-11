@@ -39,6 +39,8 @@ class TrainingResult:
     confusion_matrix: list[list[int]]
     classes: list[str]
     rows_used: int
+    test_rows_used: int
+    evaluation_mode: str
 
 
 def validate_feature_frame(df: pd.DataFrame, *, require_target: bool = False) -> None:
@@ -75,6 +77,7 @@ def balance_classes(df: pd.DataFrame, random_state: int = 42) -> pd.DataFrame:
 def train_model(
     df: pd.DataFrame,
     *,
+    test_df: pd.DataFrame | None = None,
     balance: bool = True,
     model_type: str = "random_forest",
     test_size: float = 0.2,
@@ -84,19 +87,32 @@ def train_model(
     if balance:
         training_df = balance_classes(training_df, random_state=random_state)
 
-    X = training_df[FEATURE_COLUMNS]
-    y = training_df[TARGET_COLUMN]
+    X_train = training_df[FEATURE_COLUMNS]
+    y_train = training_df[TARGET_COLUMN]
 
     label_encoder = LabelEncoder()
-    y_encoded = label_encoder.fit_transform(y)
+    y_train_encoded = label_encoder.fit_transform(y_train)
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y_encoded,
-        test_size=test_size,
-        random_state=random_state,
-        stratify=y_encoded,
-    )
+    if test_df is None:
+        X_train, X_test, y_train_encoded, y_test_encoded = train_test_split(
+            X_train,
+            y_train_encoded,
+            test_size=test_size,
+            random_state=random_state,
+            stratify=y_train_encoded,
+        )
+        evaluation_mode = "Internal stratified split"
+    else:
+        heldout_df = clean_training_frame(test_df)
+        unknown_classes = sorted(
+            set(heldout_df[TARGET_COLUMN].astype(str)) - set(label_encoder.classes_)
+        )
+        if unknown_classes:
+            unknown = ", ".join(unknown_classes)
+            raise ValueError(f"Held-out test data contains unknown class label(s): {unknown}")
+        X_test = heldout_df[FEATURE_COLUMNS]
+        y_test_encoded = label_encoder.transform(heldout_df[TARGET_COLUMN])
+        evaluation_mode = "Held-out notebook test set"
 
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
@@ -122,10 +138,10 @@ def train_model(
     else:
         raise ValueError("Unknown model type. Choose `random_forest` or `xgboost`.")
 
-    model.fit(X_train_scaled, y_train)
+    model.fit(X_train_scaled, y_train_encoded)
 
     y_pred = model.predict(X_test_scaled)
-    accuracy = accuracy_score(y_test, y_pred)
+    accuracy = accuracy_score(y_test_encoded, y_pred)
     classes = label_encoder.classes_.tolist()
 
     artifact = {
@@ -140,21 +156,29 @@ def train_model(
             "accuracy": float(accuracy),
             "classes": classes,
             "rows_used": int(len(training_df)),
+            "test_rows_used": int(len(X_test)),
+            "evaluation_mode": evaluation_mode,
         },
     }
 
     result = TrainingResult(
         accuracy=float(accuracy),
         report=classification_report(
-            y_test,
+            y_test_encoded,
             y_pred,
             target_names=classes,
             output_dict=True,
             zero_division=0,
         ),
-        confusion_matrix=confusion_matrix(y_test, y_pred).tolist(),
+        confusion_matrix=confusion_matrix(
+            y_test_encoded,
+            y_pred,
+            labels=list(range(len(classes))),
+        ).tolist(),
         classes=classes,
         rows_used=int(len(training_df)),
+        test_rows_used=int(len(X_test)),
+        evaluation_mode=evaluation_mode,
     )
     return artifact, result
 
